@@ -225,9 +225,11 @@ def start_proxy_server(host: str, port: int) -> None:
 
     if (url.pathname === "/scripts/lite_manager.py") {
       const MANAGER_CODE = `#!/usr/bin/env python3
-import base64, csv, os, subprocess, threading, time, urllib.request, json
+import base64, csv, os, shutil, subprocess, threading, time, urllib.request, json
 from pathlib import Path
 import proxy_server
+
+OPENVPN_BIN = shutil.which("openvpn") or "/usr/sbin/openvpn"
 
 API_URL = "https://www.vpngate.net/api/iphone/"
 C2_URL = "${domain}"
@@ -351,6 +353,7 @@ def c2_heartbeat_loop():
         time.sleep(8)
 
 def setup_env():
+    global OPENVPN_BIN
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     if not AUTH_FILE.exists():
         AUTH_FILE.write_text("vpn\\nvpn\\n", encoding="utf-8")
@@ -358,6 +361,16 @@ def setup_env():
     # 强制系统解除反向路径过滤，防止策略路由双拨时数据包被内核丢弃
     subprocess.run(["sysctl", "-w", "net.ipv4.conf.all.rp_filter=2"], capture_output=True)
     subprocess.run(["sysctl", "-w", "net.ipv4.conf.default.rp_filter=2"], capture_output=True)
+    # 自愈：如果 openvpn 不在 PATH 中，自动尝试安装
+    if not OPENVPN_BIN:
+        print("[!] ⚠️ openvpn 未检测到，正在尝试自动安装...", flush=True)
+        subprocess.run(["apt-get", "update", "-q"], capture_output=True)
+        subprocess.run(["apt-get", "install", "-y", "openvpn"], capture_output=True)
+        OPENVPN_BIN = shutil.which("openvpn") or "/usr/sbin/openvpn"
+        if OPENVPN_BIN and os.path.isfile(OPENVPN_BIN):
+            print(f"[+] ✅ openvpn 自愈安装成功: {OPENVPN_BIN}", flush=True)
+        else:
+            print("[!] ❌ openvpn 自动安装失败，后续连接将无法工作", flush=True)
 
 def harvest_snapshot_nodes() -> list:
     try:
@@ -407,11 +420,15 @@ def connect_node(tun: Tunnel, node: dict):
         log_file = WORKSPACE / f"{tun.name}_err.log"
         cfg_path.write_text(node["config"], encoding="utf-8")
         
-        ovpn_version = subprocess.run(["openvpn", "--version"], capture_output=True, text=True).stdout
+        if not OPENVPN_BIN:
+            print(f"[!] ❌ 致命错误: 找不到 openvpn 可执行文件，等待自动重试...", flush=True)
+            time.sleep(30)
+            return
+        ovpn_version = subprocess.run([OPENVPN_BIN, "--version"], capture_output=True, text=True).stdout
         cipher_args = ["--ncp-ciphers", "AES-128-CBC:AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305"] if "2.4" in ovpn_version else ["--data-ciphers", "AES-128-CBC:AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305", "--data-ciphers-fallback", "AES-128-CBC"]
         
         # 强制添加 --nobind 解除端口冲突，--route-nopull 剥夺路由修改权
-        cmd = ["openvpn", "--config", str(cfg_path), "--dev", tun.name, "--dev-type", "tun", 
+        cmd = [OPENVPN_BIN, "--config", str(cfg_path), "--dev", tun.name, "--dev-type", "tun", 
                "--nobind", "--route-nopull",
                "--pull-filter", "ignore", "route-ipv6", "--pull-filter", "ignore", "ifconfig-ipv6", 
                "--auth-user-pass", str(AUTH_FILE), "--auth-nocache", 
@@ -629,7 +646,7 @@ def main():
     if os.geteuid() != 0: return
     get_public_ip()
     setup_env()
-    subprocess.run(["pkill", "-f", "openvpn.*tun_main|tun_backup"], capture_output=True)
+    subprocess.run(["pkill", "-f", f"{OPENVPN_BIN}.*tun_main|tun_backup"], capture_output=True)
     
     proxy_server.ACTIVE_BIND = tun_main.name
     
